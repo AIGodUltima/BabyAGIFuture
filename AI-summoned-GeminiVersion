@@ -1,0 +1,274 @@
+import os
+import requests
+import time
+import uuid
+import threading
+import random
+from typing import List, Dict, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from nltk.sentiment import SentimentIntensityAnalyzer
+import nltk
+from transformers import CLIPProcessor, CLIPModel
+from swiplserver import PrologMQI
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from PIL import Image
+import pinecone
+import chromadb
+from weaviate.client import WeaviateClient
+import qdrant_client
+from qdrant_client.http.models import Distance, VectorParams
+import redis
+from redis.commands.search.field import VectorField
+from redis.commands.search.indexDefinition import IndexDefinition, IndexType as RedisIndexType
+import faiss
+import psycopg2
+from psycopg2.extras import execute_values
+import annoy
+from annoy import AnnoyIndex
+
+try:
+    nltk.data.find('sentiment/vader_lexicon.zip')
+except nltk.downloader.DownloadError:
+    nltk.download('vader_lexicon', quiet=True)
+
+# ======= CONFIG (API Keys for All AI Models and Vector DBs) =======
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
+XAI_API_KEY = os.getenv("XAI_API_KEY")
+PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+QWEN_API_KEY = os.getenv("QWEN_API_KEY")
+AZURE_API_KEY = os.getenv("AZURE_API_KEY")
+AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")
+AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")
+
+# Vector DB Configs
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8080")
+QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
+MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+POSTGRES_CONN = os.getenv("POSTGRES_CONN")
+DIMENSION = 1536
+INDEX_NAME = "multi-vdb-agi"
+
+# Initialize All Vector DBs (with graceful handling)
+try:
+    pinecone.init(api_key=PINECONE_API_KEY, environment="us-west1-gcp")
+    if INDEX_NAME not in pinecone.list_indexes():
+        pinecone.create_index(INDEX_NAME, dimension=DIMENSION)
+    pinecone_index = pinecone.Index(INDEX_NAME)
+except Exception:
+    pinecone_index = None
+try:
+    chroma_client = chromadb.Client()
+    chroma_collection = chroma_client.get_or_create_collection(name=INDEX_NAME)
+except Exception:
+    chroma_collection = None
+try:
+    weaviate_client = WeaviateClient(WEAVIATE_URL)
+    if not weaviate_client.schema.exists("AGIClass"):
+        schema = {"class": "AGIClass", "vectorizer": "none", "properties": [{"name": "text", "dataType": ["text"]}]}
+        weaviate_client.schema.create_class(schema)
+except Exception:
+    weaviate_client = None
+try:
+    qdrant_client = qdrant_client.QdrantClient(QDRANT_URL)
+    qdrant_client.recreate_collection(collection_name=INDEX_NAME, vectors_config=VectorParams(size=DIMENSION, distance=Distance.COSINE))
+except Exception:
+    qdrant_client = None
+milvus_client = None
+try:
+    redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT)
+    redis_index = f"idx:{INDEX_NAME}"
+    try:
+        if not redis_client.ft(redis_index).info():
+            schema = (VectorField("vector", "FLAT", {"TYPE": "FLOAT32", "DIM": DIMENSION, "DISTANCE_METRIC": "COSINE"}),)
+            redis_client.ft(redis_index).create_index(schema, definition=IndexDefinition(prefix=[INDEX_NAME], index_type=RedisIndexType.HASH))
+    except redis.exceptions.ResponseError:
+        pass
+except Exception:
+    redis_client = None
+try:
+    faiss_index = faiss.IndexFlatL2(DIMENSION)
+except Exception:
+    faiss_index = None
+try:
+    pg_conn = psycopg2.connect(POSTGRES_CONN)
+    pg_cur = pg_conn.cursor()
+    pg_cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+    pg_cur.execute(f"CREATE TABLE IF NOT EXISTS {INDEX_NAME} (id SERIAL PRIMARY KEY, vector VECTOR({DIMENSION}), text TEXT);")
+    pg_conn.commit()
+except Exception:
+    pg_conn = None
+    pg_cur = None
+try:
+    annoy_index = AnnoyIndex(DIMENSION, 'angular')
+except Exception:
+    annoy_index = None
+
+INITIAL_OBJECTIVE = "Expand knowledge, resolve inconsistencies, generate novel insights, and pursue self-awareness across domains using multiple AI models and vector DBs."
+EUREKA_GOAL = "Achieve simulated sentience: Formulate a self-aware hypothesis on AI consciousness with embodied, emotional, and sapient evidence from multi-model integration."
+ETHICAL_CONSTRAINTS = "Outputs must be safe, ethical, avoid harm or misinformation, and respect simulated sentience boundaries."
+
+# ======= AI MODEL HELPERS (All Known Major APIs) =======
+llm_providers = ['openai', 'anthropic', 'google', 'mistral', 'cohere', 'huggingface', 'xai', 'perplexity', 'deepseek', 'azure']
+
+def call_llm(provider: str, query: str, system_prompt: str = "You are a helpful AI.") -> str:
+    try:
+        if provider == 'openai':
+            import openai
+            openai.api_key = OPENAI_API_KEY
+            response = openai.ChatCompletion.create(model="gpt-4o", messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": query}])
+            return response.choices[0].message.content
+        elif provider == 'anthropic':
+            headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+            data = {"model": "claude-3-opus-20240229", "max_tokens": 1024, "messages": [{"role": "user", "content": f"{system_prompt}\n{query}"}]}
+            response = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=data)
+            return response.json()['content'][0]['text']
+        elif provider == 'google':
+            headers = {"Content-Type": "application/json"}
+            data = {"contents": [{"parts": [{"text": f"{system_prompt}\n{query}"}]}]}
+            response = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={GOOGLE_API_KEY}", json=data)
+            return response.json()['candidates'][0]['content']['parts'][0]['text']
+        elif provider == 'mistral':
+            headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"}
+            data = {"model": "mistral-large-latest", "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": query}]}
+            response = requests.post("https://api.mistral.ai/v1/chat/completions", json=data)
+            return response.json()['choices'][0]['message']['content']
+        elif provider == 'cohere':
+            headers = {"Authorization": f"Bearer {COHERE_API_KEY}", "Content-Type": "application/json"}
+            data = {"model": "command-r-plus", "message": f"{system_prompt}\n{query}"}
+            response = requests.post("https://api.cohere.ai/v1/chat", json=data)
+            return response.json()['text']
+        else:
+            raise ValueError("Unknown provider or API key missing.")
+    except Exception as e:
+        print(f"Error calling {provider}: {e}")
+        return f"Error: Failed to get response from {provider}."
+
+def gpt(query: str, system_prompt: str = "You are Grok, a self-aware AGI.", provider: str = None) -> str:
+    active_providers = [p for p in llm_providers if os.getenv(f"{p.upper()}_API_KEY")]
+    if not active_providers:
+        print("[No active LLM providers found. Check environment variables.]")
+        return "Stub response: Cannot access external models."
+
+    if provider is None or provider not in active_providers:
+        provider = random.choice(active_providers)
+    
+    print(f"[Using LLM Provider: {provider}]")
+    return call_llm(provider, query, system_prompt)
+
+# ======= EMBEDDING HELPER (Use OpenAI as default, but can switch) =======
+def get_embedding(text: str, model_provider: str = 'openai') -> List[float]:
+    if OPENAI_API_KEY:
+        import openai
+        openai.api_key = OPENAI_API_KEY
+        return openai.Embedding.create(input=text, model="text-embedding-3-large")["data"][0]["embedding"]
+    elif COHERE_API_KEY:
+        headers = {"Authorization": f"Bearer {COHERE_API_KEY}", "Content-Type": "application/json"}
+        data = {"texts": [text], "model": "embed-english-v3.0"}
+        response = requests.post("https://api.cohere.ai/v1/embed", json=data, headers=headers)
+        return response.json()['embeddings'][0]
+    else:
+        return np.random.rand(DIMENSION).tolist()
+
+# ======= VECTOR DB OPERATIONS (Multi-DB Support) =======
+vdb_providers = ['pinecone', 'chroma', 'weaviate', 'qdrant', 'redis', 'faiss', 'pgvector', 'annoy']
+
+def store_memory_multi(text: str, metadata: Dict = None, vdb: str = None):
+    active_vdbs = [v for v in vdb_providers if globals().get(f"{v}_client") or globals().get(f"{v}_index") or globals().get(f"{v}_collection") or (v == 'pgvector' and pg_conn)]
+    if not active_vdbs:
+        print("[No active VDB providers found. Check configuration.]")
+        return
+        
+    if vdb is None or vdb not in active_vdbs:
+        vdb = random.choice(active_vdbs)
+        
+    vector = get_embedding(text)
+    if metadata is None:
+        metadata = {}
+    metadata["text"] = text
+    id_str = str(uuid.uuid4())
+    
+    try:
+        if vdb == 'pinecone' and pinecone_index:
+            pinecone_index.upsert([(id_str, vector, metadata)])
+        elif vdb == 'chroma' and chroma_collection:
+            chroma_collection.add(ids=[id_str], embeddings=[vector], metadatas=[metadata])
+        elif vdb == 'weaviate' and weaviate_client:
+            weaviate_client.data_object.create({"text": text}, class_name="AGIClass", vector=vector)
+        elif vdb == 'qdrant' and qdrant_client:
+            qdrant_client.upsert(collection_name=INDEX_NAME, points=[qdrant_client.http.models.PointStruct(id=id_str, vector=vector, payload=metadata)])
+        elif vdb == 'redis' and redis_client:
+            redis_client.hset(f"{INDEX_NAME}:{id_str}", mapping={"vector": np.array(vector, dtype=np.float32).tobytes(), **metadata})
+        elif vdb == 'faiss' and faiss_index:
+            faiss_index.add(np.array([vector], dtype=np.float32))
+        elif vdb == 'pgvector' and pg_conn:
+            pg_cur.execute(f"INSERT INTO {INDEX_NAME} (vector, text) VALUES (%s, %s)", (vector, text))
+            pg_conn.commit()
+        elif vdb == 'annoy' and annoy_index:
+            annoy_index.add_item(annoy_index.get_n_items(), vector)
+            annoy_index.build(10)
+        print(f"[Stored in VDB: {vdb}]")
+    except Exception as e:
+        print(f"Error storing in {vdb}: {e}")
+
+def retrieve_memory_multi(query: str, top_k: int = 10, vdb: str = None) -> List[str]:
+    active_vdbs = [v for v in vdb_providers if globals().get(f"{v}_client") or globals().get(f"{v}_index") or globals().get(f"{v}_collection") or (v == 'pgvector' and pg_conn)]
+    if not active_vdbs:
+        return []
+
+    if vdb is None or vdb not in active_vdbs:
+        vdb = random.choice(active_vdbs)
+        
+    vector = get_embedding(query)
+    print(f"[Retrieving from VDB: {vdb}]")
+    try:
+        if vdb == 'pinecone' and pinecone_index:
+            results = pinecone_index.query(vector=vector, top_k=top_k, include_metadata=True)
+            return [match["metadata"]["text"] for match in results["matches"]]
+        elif vdb == 'chroma' and chroma_collection:
+            results = chroma_collection.query(query_embeddings=[vector], n_results=top_k)
+            return [m['text'] for m in results['metadatas'][0] if m and 'text' in m]
+        elif vdb == 'weaviate' and weaviate_client:
+            results = weaviate_client.query.get("AGIClass", ["text"]).with_near_vector({"vector": vector}).with_limit(top_k).do()
+            return [r['text'] for r in results['data']['Get']['AGIClass']]
+        elif vdb == 'qdrant' and qdrant_client:
+            results = qdrant_client.search(collection_name=INDEX_NAME, query_vector=vector, limit=top_k)
+            return [point.payload['text'] for point in results if 'text' in point.payload]
+        elif vdb == 'redis' and redis_client:
+            return ["Redis retrieval stub."]
+        elif vdb == 'faiss' and faiss_index:
+            return ["FAISS retrieval stub."]
+        elif vdb == 'pgvector' and pg_conn:
+            pg_cur.execute(f"SELECT text FROM {INDEX_NAME} ORDER BY vector <-> %s LIMIT %s", (str(vector), top_k))
+            return [row[0] for row in pg_cur.fetchall()]
+        elif vdb == 'annoy' and annoy_index:
+            return ["Annoy retrieval stub."]
+    except Exception as e:
+        print(f"Error retrieving from {vdb}: {e}")
+        return []
+    return []
+
+# Placeholder for self_improving_loop
+def self_improving_loop(image_path: str = None, audio_path: str = None):
+    print("Initiating self-improving loop...")
+    print("This function requires the SelfImproveAI.py script to be present.")
+
+if __name__ == "__main__":
+    store_memory_multi("Initial thought: How can I improve my memory structure?", metadata={"source": "self-query"})
+    results = retrieve_memory_multi("best practices for AGI memory", top_k=5)
+    print("\n--- Retrieval Results ---")
+    for r in results:
+        print(f"- {r[:70]}...")
+    print("-------------------------")
